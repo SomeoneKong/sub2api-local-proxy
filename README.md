@@ -26,6 +26,8 @@ codex 的 `base_url` 与 `model_catalog_url` 指向它。请求原样转发给�
 ./build.sh
 ```
 
+只要程序本身也可以 `go install github.com/SomeoneKong/sub2api-local-proxy@latest`，再手动写配置、设开机启动。
+
 所有平台的程序、配置、目录缓存都在 `~/.sub2api-local-proxy/`（`bin/`、`config.json`、`cache/`）。
 安装脚本重复执行即升级：换程序、重启，配置不动。新程序先暂存并用它校验配置，通过了才停旧实例、替换、
 启动，校验不过时正在运行的实例不受影响；启动后检查进程确实在运行，没起来就报错并打印日志。

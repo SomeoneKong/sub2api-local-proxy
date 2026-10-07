@@ -1,4 +1,4 @@
-module sub2api-local-proxy
+module github.com/SomeoneKong/sub2api-local-proxy
 
 go 1.27
 
