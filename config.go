@@ -29,6 +29,17 @@ type config struct {
 	// （粘性会话等位最长 120 秒，上游 OpenAI 的响应头不设超时），所以要留足余量。超时回 504、不重发。
 	ResponseHeaderTimeout duration `json:"response_header_timeout"`
 
+	// 网关排队类 429（error.type 为 rate_limit_error、error.code 在 retry_429_codes 里，空串表示无 code）
+	// 由代理退避后重发同一请求，客户端看不到这次 429。预算从请求进来时起算：下一次间隔会超过
+	// retry_429_max_wait 就不再重发，重发出去的到 retry_429_max_wait 还没拿到响应头就取消，都交回 429。
+	// 间隔从 base_delay 起翻倍、不超过 max_delay，再加 ±30% 抖动，Retry-After 是下限。
+	// 其它 429（额度、RPM 等）一律原样交回。
+	Retry429          bool     `json:"retry_429"`
+	Retry429Codes     []string `json:"retry_429_codes"`
+	Retry429MaxWait   duration `json:"retry_429_max_wait"`
+	Retry429BaseDelay duration `json:"retry_429_base_delay"`
+	Retry429MaxDelay  duration `json:"retry_429_max_delay"`
+
 	// 模型目录缓存（只管带 client_version 的 codex 格式目录）：回源失败时返回最近一次成功的目录。
 	// 关掉时目录请求与其他请求一样原样转发。
 	CatalogCache   bool     `json:"catalog_cache"`
@@ -54,6 +65,11 @@ func defaultConfig() config {
 		UpstreamWait:          duration(60 * time.Second),
 		HealthPath:            "/health",
 		ResponseHeaderTimeout: duration(5 * time.Minute),
+		Retry429:              true,
+		Retry429Codes:         []string{"gateway_queue_full", "gateway_concurrency_limit", ""},
+		Retry429MaxWait:       duration(2 * time.Minute),
+		Retry429BaseDelay:     duration(2 * time.Second),
+		Retry429MaxDelay:      duration(30 * time.Second),
 		CatalogCache:          true,
 		CatalogPath:           "/v1/models",
 		CatalogTimeout:        duration(3 * time.Second),
@@ -160,6 +176,9 @@ func (c *config) validate() error {
 	}
 	if c.ResponseHeaderTimeout < 0 {
 		return errors.New("response_header_timeout 不能为负")
+	}
+	if c.Retry429 && (c.Retry429MaxWait <= 0 || c.Retry429BaseDelay <= 0 || c.Retry429MaxDelay < c.Retry429BaseDelay) {
+		return errors.New("retry_429 打开时 retry_429_max_wait、retry_429_base_delay 必须大于 0，retry_429_max_delay 不能小于 retry_429_base_delay")
 	}
 	if c.CatalogTimeout <= 0 {
 		return errors.New("catalog_timeout 必须大于 0")

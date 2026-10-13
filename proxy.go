@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -73,11 +74,20 @@ func newProxy(cfg *config, gate *upstreamGate) (*proxy, error) {
 	if cfg.WaitForUpstream {
 		wait = cfg.UpstreamWait.D()
 	}
+	var r429 *retry429
+	if cfg.Retry429 {
+		r429 = &retry429{codes: map[string]bool{}, maxWait: cfg.Retry429MaxWait.D(),
+			base: cfg.Retry429BaseDelay.D(), maxDelay: cfg.Retry429MaxDelay.D()}
+		for _, c := range cfg.Retry429Codes {
+			r429.codes[c] = true
+		}
+	}
 	p.rp = &httputil.ReverseProxy{
 		// Rewrite 模式不加 X-Forwarded-*，入站的同名头也会被去掉；Host 换成网关的。
 		// 网关默认信任这些头来认客户端 IP，加上会影响按 IP 限制的 key。
-		Rewrite:       func(pr *httputil.ProxyRequest) { pr.SetURL(cfg.upstreamURL) },
-		Transport:     &resilientTransport{base: base, gate: gate, wait: wait, headerTimeout: cfg.ResponseHeaderTimeout.D()},
+		Rewrite: func(pr *httputil.ProxyRequest) { pr.SetURL(cfg.upstreamURL) },
+		Transport: &resilientTransport{base: base, gate: gate, wait: wait,
+			headerTimeout: cfg.ResponseHeaderTimeout.D(), r429: r429},
 		FlushInterval: -1, // SSE 逐块转发
 		ErrorHandler:  proxyError,
 	}
@@ -110,6 +120,8 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Header.Get("Content-Encoding") == "zstd" && sent != raw {
 		note = fmt.Sprintf(" zstd %d→%d", raw, sent)
 	}
+	rn := &retryNote{}
+	r = r.WithContext(context.WithValue(r.Context(), retryNoteKey{}, rn))
 	rec := &statusRecorder{ResponseWriter: w}
 	defer func() {
 		// 响应开始后转发不下去时，ReverseProxy 以 ErrAbortHandler 掐断客户端连接：上游中断时客户端看到的是
@@ -120,12 +132,27 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if r.Context().Err() != nil {
 				why = "客户端先断开"
 			}
-			log.Printf("%s %s %d %.1fs%s %s", r.Method, r.URL.Path, rec.status, time.Since(start).Seconds(), note, why)
+			log.Printf("%s %s %d %.1fs%s%s %s", r.Method, r.URL.Path, rec.status, time.Since(start).Seconds(), note, rn.fields(rec.status, r), why)
 			panic(v)
 		}
 	}()
 	p.rp.ServeHTTP(rec, r)
-	log.Printf("%s %s %d %.1fs%s", r.Method, r.URL.Path, rec.status, time.Since(start).Seconds(), note)
+	log.Printf("%s %s %d %.1fs%s%s", r.Method, r.URL.Path, rec.status, time.Since(start).Seconds(), note, rn.fields(rec.status, r))
+}
+
+// fields 是日志行末尾的 429 字段：最终回了 429 或中途重发过时才有。记最后一次 429 的 code 与等待对象、
+// 重发次数、退避等待的总时长、结局（见 retryNote.end）、X-Request-ID，以及会话头 session-id 的前 8 位
+// （同一会话的几次 429 可以对上）。请求总耗时在行首的秒数里，含各次发送在网关里排队的时间。
+func (n *retryNote) fields(status int, r *http.Request) string {
+	if status != http.StatusTooManyRequests && n.retries == 0 && n.end == "" {
+		return ""
+	}
+	sess := r.Header.Get("session-id")
+	if len(sess) > 8 {
+		sess = sess[:8]
+	}
+	return fmt.Sprintf(" code=%s scope=%s retries=%d wait=%.1fs end=%s req_id=%s sess=%s",
+		n.code, n.scope, n.retries, n.waited.Seconds(), n.end, n.reqID, sess)
 }
 
 var errBodyTooLarge = errors.New("请求体超过 256 MiB")
@@ -166,6 +193,9 @@ func proxyError(w http.ResponseWriter, r *http.Request, err error) {
 		return
 	}
 	log.Printf("%s %s 转发失败: %v", r.Method, r.URL.Path, err)
+	if n := noteFrom(r.Context()); n.retries > 0 {
+		markRetried(w.Header(), n)
+	}
 	code := http.StatusBadGateway
 	if errors.Is(err, errHeaderTimeout) {
 		code = http.StatusGatewayTimeout

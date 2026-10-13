@@ -33,6 +33,9 @@ func TestConfigDefaultsAndOverlay(t *testing.T) {
 	if c.Listen != "127.0.0.1:28770" || c.ZstdLevel != 3 || len(c.CompressPaths) != 3 {
 		t.Fatalf("默认值不对: %+v", c)
 	}
+	if !c.Retry429 || c.Retry429MaxWait.D() != 2*time.Minute || len(c.Retry429Codes) != 3 {
+		t.Fatalf("429 重试默认值不对: %+v", c)
+	}
 	if c.upstreamURL.String() != "http://10.0.0.1:8080" || c.cacheDir != filepath.Join(dir, "cache") {
 		t.Fatalf("upstream %s，cacheDir %s", c.upstreamURL, c.cacheDir)
 	}
@@ -56,6 +59,8 @@ func TestConfigRejects(t *testing.T) {
 		"尾随垃圾":              `{"upstream": "http://h:1"} trailing`,
 		"第二个对象":             `{"upstream": "http://h:1"} {"compress": false}`,
 		"响应头超时为负":           `{"upstream": "http://h:1", "response_header_timeout": "-1s"}`,
+		"429 重试预算为 0":       `{"upstream": "http://h:1", "retry_429_max_wait": "0s"}`,
+		"429 最大间隔小于起始间隔":    `{"upstream": "http://h:1", "retry_429_base_delay": "10s", "retry_429_max_delay": "5s"}`,
 	}
 	for name, body := range cases {
 		path := filepath.Join(t.TempDir(), "config.json")
@@ -66,9 +71,10 @@ func TestConfigRejects(t *testing.T) {
 	}
 	for name, body := range map[string]string{
 		"等待关闭时 upstream_wait 不受限制": `{"upstream": "http://h:1", "wait_for_upstream": false, "upstream_wait": "0s"}`,
-		"末尾空白":         "{\"upstream\": \"http://h:1\"}\n\n  ",
-		"IPv6":         `{"upstream": "http://[::1]:8080"}`,
-		"响应头超时 0 表示不限": `{"upstream": "http://h:1", "response_header_timeout": "0s"}`,
+		"末尾空白":            "{\"upstream\": \"http://h:1\"}\n\n  ",
+		"IPv6":            `{"upstream": "http://[::1]:8080"}`,
+		"响应头超时 0 表示不限":    `{"upstream": "http://h:1", "response_header_timeout": "0s"}`,
+		"429 重试关闭时预算不受限制": `{"upstream": "http://h:1", "retry_429": false, "retry_429_max_wait": "0s"}`,
 	} {
 		path := filepath.Join(t.TempDir(), "config.json")
 		writeConfig(t, path, body)
