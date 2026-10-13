@@ -189,11 +189,14 @@ var errRetryBudget = errors.New("429 重发预算或读体时限已到")
 
 // retryNote 由 ServeHTTP 放进请求的 context，RoundTrip 把 429 与重发的情况记在里面，供日志使用。
 type retryNote struct {
+	lid     string        // 本地请求 ID：同一请求的各条重发行与结束行用它对上（各次发送的上游 X-Request-ID 互不相同）
 	code    string        // 最后一次 429 的 error.code
 	scope   string        // gateway_concurrency_limit 等的是哪一级的空位（account／user），取自 error.message
 	reqID   string        // 最后一次 429 的 X-Request-ID，可到网关日志里对
 	retries int           // 重发次数
 	waited  time.Duration // 退避等待的总时长，不含各次发送在网关里排队的时间
+	failed  time.Duration // 失败发送的总时长：各次收到 429 的发送累计到响应头（包括连接恢复后收到 429 的那次），
+	// 重发到预算仍没收到响应头的发送累计到取消；不计等网关恢复、连接失败的发送及其重试间隔
 	// end 是 429 之后的结局：ok 重发后拿到非 429 响应；pass 不在重发范围；budget 下一次间隔会超出预算；
 	// deadline 重发在预算内没拿到响应头（交回上一次的 429）；error 重发失败或网关地址已换（本地回 502／504）；
 	// cancel 退避中客户端离开。
@@ -235,9 +238,10 @@ func (t *resilientTransport) RoundTrip(req *http.Request) (*http.Response, error
 		if n > 0 { // 重发到 maxWait 还没拿到响应头就取消；拿到响应头后解除，之后的响应体不受影响
 			budget = time.AfterFunc(time.Until(start.Add(t.r429.maxWait)), abort).Stop
 		}
-		sent := time.Now()
-		resp, err := t.roundTrip(out)
+		var took time.Duration
+		resp, err := t.roundTrip(out, &took)
 		if !budget() {
+			note.failed += took
 			if err == nil {
 				resp.Body.Close()
 			}
@@ -247,6 +251,9 @@ func (t *resilientTransport) RoundTrip(req *http.Request) (*http.Response, error
 			note.end = "deadline"
 			markRetried(last.Header, note)
 			return last, nil
+		}
+		if err == nil && resp.StatusCode == http.StatusTooManyRequests {
+			note.failed += took
 		}
 		if err != nil || resp.StatusCode != http.StatusTooManyRequests || t.r429 == nil {
 			if n > 0 {
@@ -284,8 +291,8 @@ func (t *resilientTransport) RoundTrip(req *http.Request) (*http.Response, error
 		resp.Body.Close()
 		resp.Body = io.NopCloser(bytes.NewReader(body))
 		last = resp
-		log.Printf("%s %s 429 %s%s req_id=%s，这次发送用了 %.1f 秒，%.1f 秒后第 %d 次重发", req.Method, req.URL.Path,
-			note.code, scopeSuffix(note.scope), note.reqID, time.Since(sent).Seconds(), delay.Seconds(), n+1)
+		log.Printf("%s %s 429 %s%s lid=%s req_id=%s，这次发送用了 %.1f 秒，%.1f 秒后第 %d 次重发", req.Method, req.URL.Path,
+			note.code, scopeSuffix(note.scope), note.lid, note.reqID, took.Seconds(), delay.Seconds(), n+1)
 		if err := t.backoff(req.Context(), delay, note); err != nil {
 			return nil, err
 		}
@@ -417,11 +424,14 @@ func parseRetryAfter(v string) time.Duration {
 }
 
 // roundTrip 是拿到响应头之前的兜底：网关不可用时等它恢复，发送失败时等网关恢复后重发。
-func (t *resilientTransport) roundTrip(req *http.Request) (*http.Response, error) {
+// took 记最后一次发送从发出到响应头的时长；在发送中被取消的也记到取消为止；在等待恢复或连接失败后的间隔里
+// 退出的记 0（这段时间不是在网关里排队）。
+func (t *resilientTransport) roundTrip(req *http.Request, took *time.Duration) (*http.Response, error) {
 	ctx := req.Context()
 	deadline := time.Now().Add(t.wait)
 	var lastErr error
 	for attempt := 1; ; attempt++ {
+		*took = 0
 		if attempt > 1 && !time.Now().Before(deadline) {
 			return nil, fmt.Errorf("%w（最近一次错误: %v）", errUpstreamDown, lastErr)
 		}
@@ -440,14 +450,17 @@ func (t *resilientTransport) roundTrip(req *http.Request) (*http.Response, error
 				return nil, err
 			}
 		}
+		sent := time.Now()
 		resp, err := t.send(out)
 		if err == nil {
+			*took = time.Since(sent)
 			if resp.StatusCode != http.StatusSwitchingProtocols {
 				resp.Body = &watchedBody{ReadCloser: resp.Body, ctx: ctx, gate: t.gate}
 			}
 			return resp, nil
 		}
 		if ctx.Err() != nil {
+			*took = time.Since(sent)
 			return nil, err
 		}
 		lastErr = err

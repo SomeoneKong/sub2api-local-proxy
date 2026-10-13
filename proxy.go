@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -120,7 +121,7 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Header.Get("Content-Encoding") == "zstd" && sent != raw {
 		note = fmt.Sprintf(" zstd %d→%d", raw, sent)
 	}
-	rn := &retryNote{}
+	rn := &retryNote{lid: fmt.Sprintf("%012x", rand.Uint64()>>16)}
 	r = r.WithContext(context.WithValue(r.Context(), retryNoteKey{}, rn))
 	rec := &statusRecorder{ResponseWriter: w}
 	defer func() {
@@ -140,9 +141,10 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("%s %s %d %.1fs%s%s", r.Method, r.URL.Path, rec.status, time.Since(start).Seconds(), note, rn.fields(rec.status, r))
 }
 
-// fields 是日志行末尾的 429 字段：最终回了 429 或中途重发过时才有。记最后一次 429 的 code 与等待对象、
-// 重发次数、退避等待的总时长、结局（见 retryNote.end）、X-Request-ID，以及会话头 session-id 的前 8 位
-// （同一会话的几次 429 可以对上）。请求总耗时在行首的秒数里，含各次发送在网关里排队的时间。
+// fields 是日志行末尾的 429 字段：最终回了 429 或中途重发过时才有。记本地请求 ID（与重发行对上）、
+// 最后一次 429 的 code 与等待对象、重发次数、退避等待与失败发送的总时长、结局（见 retryNote.end）、
+// X-Request-ID，以及会话头 session-id 的前 8 位（同一会话的几次 429 可以对上）。请求总耗时在行首的秒数里，
+// 含成功那次发送的排队与之后的整段响应体，所以不能拿它减去 wait、fail 当作等待。
 func (n *retryNote) fields(status int, r *http.Request) string {
 	if status != http.StatusTooManyRequests && n.retries == 0 && n.end == "" {
 		return ""
@@ -151,8 +153,8 @@ func (n *retryNote) fields(status int, r *http.Request) string {
 	if len(sess) > 8 {
 		sess = sess[:8]
 	}
-	return fmt.Sprintf(" code=%s scope=%s retries=%d wait=%.1fs end=%s req_id=%s sess=%s",
-		n.code, n.scope, n.retries, n.waited.Seconds(), n.end, n.reqID, sess)
+	return fmt.Sprintf(" lid=%s code=%s scope=%s retries=%d wait=%.1fs fail=%.1fs end=%s req_id=%s sess=%s",
+		n.lid, n.code, n.scope, n.retries, n.waited.Seconds(), n.failed.Seconds(), n.end, n.reqID, sess)
 }
 
 var errBodyTooLarge = errors.New("请求体超过 256 MiB")

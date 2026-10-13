@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -501,5 +504,99 @@ func TestRetry429NoteResetPerResponse(t *testing.T) {
 	resp.Body.Close()
 	if string(b) != "Too Many Requests" || note.code != "" || note.scope != "" || note.reqID != "r2" || note.retries != 1 || note.end != "pass" {
 		t.Fatalf("body %q，note %+v", b, *note)
+	}
+}
+
+// 同一请求的各条重发行与结束行带同一个本地请求 ID（lid），结束行的 fail 是各次 429 发送的耗时之和。
+func TestRetry429LogLinksAttempts(t *testing.T) {
+	var buf bytes.Buffer
+	var mu sync.Mutex
+	prev := log.Writer()
+	t.Cleanup(func() { log.SetOutput(prev) })
+	log.SetOutput(writerFunc(func(p []byte) (int, error) { mu.Lock(); defer mu.Unlock(); return buf.Write(p) }))
+	var n atomic.Int32
+	up := newFlakyUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		if n.Add(1) <= 2 {
+			time.Sleep(150 * time.Millisecond)
+			gatewayBusy(w, "gateway_queue_full")
+			return
+		}
+		io.WriteString(w, "ok")
+	})
+	px, _ := newTestProxy(t, up.URL, fastRetry, func(c *config) { c.Compress = false })
+	resp := post(t, px.URL+"/v1/responses", []byte(`{"input":"x"}`), nil)
+	io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	px.Close() // 等 handler 写完结束行
+	mu.Lock()
+	out := buf.String()
+	mu.Unlock()
+	retryLines := regexp.MustCompile(`429 gateway_queue_full\S* lid=([0-9a-f]{12}) `).FindAllStringSubmatch(out, -1)
+	end := regexp.MustCompile(` 200 [\d.]+s lid=([0-9a-f]{12}) .* fail=([\d.]+)s end=ok`).FindStringSubmatch(out)
+	if len(retryLines) != 2 || end == nil {
+		t.Fatalf("应有 2 条重发行与 1 条结束行:\n%s", out)
+	}
+	for _, m := range retryLines {
+		if m[1] != end[1] {
+			t.Fatalf("重发行 lid %s 与结束行 lid %s 不同:\n%s", m[1], end[1], out)
+		}
+	}
+	if f, _ := strconv.ParseFloat(end[2], 64); f < 0.25 {
+		t.Fatalf("fail=%ss，两次 429 发送各约 150ms，累计应不少于 0.25s:\n%s", end[2], out)
+	}
+}
+
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
+
+// 关闭 429 重试时，那次拿到 429 的发送照样计入 fail。
+func TestRetry429FailCountedWhenDisabled(t *testing.T) {
+	up := newFlakyUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(80 * time.Millisecond)
+		gatewayBusy(w, "gateway_queue_full")
+	})
+	_, p := newTestProxy(t, up.URL, func(c *config) { c.Retry429 = false })
+	resp, err, note := roundTripWithNote(t, p, context.Background(), up.URL+"/v1/responses")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusTooManyRequests || up.requests.Load() != 1 || note.failed < 70*time.Millisecond {
+		t.Fatalf("status %d，网关收到 %d 次，failed %v", resp.StatusCode, up.requests.Load(), note.failed)
+	}
+}
+
+// 连接断开后等网关恢复再发：fail 只计拿到 429 的那次发送，不含连接失败后的等待间隔。
+func TestRetry429FailExcludesConnectRetry(t *testing.T) {
+	var n atomic.Int32
+	up := newFlakyUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		switch n.Add(1) {
+		case 1:
+			if conn, _, err := http.NewResponseController(w).Hijack(); err == nil {
+				conn.Close()
+			}
+		case 2:
+			time.Sleep(80 * time.Millisecond)
+			gatewayBusy(w, "gateway_queue_full")
+		default:
+			io.WriteString(w, "ok")
+		}
+	})
+	_, p := newTestProxy(t, up.URL, fastRetry)
+	start := time.Now()
+	resp, err, note := roundTripWithNote(t, p, context.Background(), up.URL+"/v1/responses")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 || note.retries != 1 || time.Since(start) < retryBackoff {
+		t.Fatalf("status %d，retries %d，用时 %v", resp.StatusCode, note.retries, time.Since(start))
+	}
+	if note.failed < 70*time.Millisecond || note.failed > 500*time.Millisecond {
+		t.Fatalf("failed %v，应约为拿到 429 那次发送的 80ms，不含 %v 的重连间隔", note.failed, retryBackoff)
 	}
 }
