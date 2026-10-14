@@ -188,6 +188,50 @@ func TestReloadCatalogCacheSwitch(t *testing.T) {
 	}
 }
 
+// 网关地址换掉之后，原地址上还没做完的后台目录回源不写缓存，盖不掉新地址取得的目录。
+func TestReloadStaleCatalogFetchNotStored(t *testing.T) {
+	upA, upB := newCatalogUpstream(t), newCatalogUpstream(t)
+	upA.body.Store(`{"models":[{"slug":"from-a"}]}`)
+	upA.mode.Store("slow")
+	const fast = `, "catalog_timeout": "500ms"`
+	a, path := startApp(t, appConfig("127.0.0.1:0", upA.URL, fast))
+	old := a.cur.Load()
+	if code, _, _ := getCatalog(t, "http://"+a.addr(), "k1", "0.160.1"); code != http.StatusBadGateway {
+		t.Fatalf("A 慢且没有缓存，应为 502，得到 %d", code)
+	}
+	writeConfig(t, path, appConfig("127.0.0.1:0", upB.URL, fast))
+	a.reload()
+	if _, body, src := getCatalog(t, "http://"+a.addr(), "k1", "0.160.1"); src != "upstream" || body != catalogV1 {
+		t.Fatalf("换到 B 后应拿到 B 的目录，得到 %q %q", body, src)
+	}
+	waitFetchesIdle(t, old)
+	upB.mode.Store("503")
+	if _, body, src := getCatalog(t, "http://"+a.addr(), "k1", "0.160.1"); src != "cache" || body != catalogV1 {
+		t.Fatalf("A 迟到的结果不应盖掉 B 的缓存，得到 %q %q", body, src)
+	}
+}
+
+// 网关地址没变的热加载不影响后台回源写缓存。
+func TestReloadSameUpstreamKeepsBackgroundRefresh(t *testing.T) {
+	up := newCatalogUpstream(t)
+	const v2 = `{"models":[{"slug":"v2"}]}`
+	a, path := startApp(t, appConfig("127.0.0.1:0", up.URL, `, "catalog_timeout": "500ms"`))
+	getCatalog(t, "http://"+a.addr(), "k1", "0.160.1")
+	up.body.Store(v2)
+	up.mode.Store("slow")
+	old := a.cur.Load()
+	if _, _, src := getCatalog(t, "http://"+a.addr(), "k1", "0.160.1"); src != "cache" {
+		t.Fatalf("慢网关应先回缓存，来源 %q", src)
+	}
+	writeConfig(t, path, appConfig("127.0.0.1:0", up.URL, `, "catalog_timeout": "500ms", "compress": false`))
+	a.reload()
+	waitFetchesIdle(t, old)
+	up.mode.Store("503")
+	if _, body, src := getCatalog(t, "http://"+a.addr(), "k1", "0.160.1"); src != "cache" || body != v2+"\n" {
+		t.Fatalf("地址没变时后台回源应照常写缓存，得到 %q %q", body, src)
+	}
+}
+
 func TestReloadListen(t *testing.T) {
 	up, ch := recordingUpstream(t)
 	a, path := startApp(t, appConfig("127.0.0.1:0", up.URL, ""))

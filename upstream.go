@@ -45,6 +45,7 @@ type upstreamGate struct {
 	since   time.Time
 	upCh    chan struct{} // 可用时是已关闭的通道；转为不可用时换成新通道，恢复时关闭
 	stopped chan struct{} // 配置换了网关地址时关闭：探活退出，等待中的请求放弃
+	stopMu  sync.RWMutex  // stop 与 ifActive 互斥：stop 返回之后，原地址上的后台工作不再落盘
 }
 
 func newUpstreamGate(healthURL string, transport *http.Transport) *upstreamGate {
@@ -60,7 +61,23 @@ func newUpstreamGate(healthURL string, transport *http.Transport) *upstreamGate 
 	}
 }
 
-func (g *upstreamGate) stop() { close(g.stopped) }
+func (g *upstreamGate) stop() {
+	g.stopMu.Lock()
+	defer g.stopMu.Unlock()
+	close(g.stopped)
+}
+
+// ifActive 在闸门未停用时执行 f 并返回 true，已停用时不执行、返回 false；stop 会等进行中的 f 做完。
+// 原地址上的后台目录回源经它写缓存：网关地址换掉之后，迟到的结果不会盖掉新地址取得的目录。
+func (g *upstreamGate) ifActive(f func()) bool {
+	g.stopMu.RLock()
+	defer g.stopMu.RUnlock()
+	if g.isStopped() {
+		return false
+	}
+	f()
+	return true
+}
 
 func (g *upstreamGate) isDown() bool {
 	g.mu.Lock()

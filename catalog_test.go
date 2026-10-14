@@ -87,7 +87,7 @@ func getCatalog(t *testing.T, base, key, version string) (int, string, string) {
 
 const catalogV1 = `{"models":[{"slug":"gpt-6.1-sol"}]}` + "\n"
 
-// waitGateUp 等探活把网关标回可用（回源超时会触发一次探活）。
+// waitGateUp 等探活把网关标回可用（回源连接失败会触发一次探活）。
 func waitGateUp(t *testing.T, p *proxy) {
 	t.Helper()
 	for i := 0; i < 100 && p.gate.isDown(); i++ {
@@ -115,6 +115,7 @@ func TestCatalogFallsBackToCache(t *testing.T) {
 			t.Fatalf("%s: 用了 %v，应在回源超时后立即返回缓存", mode, el)
 		}
 		waitGateUp(t, p)
+		waitFetchesIdle(t, p) // 慢网关的回源在后台继续，等它结束再换下一种表现
 	}
 	// 网关恢复且目录更新后，返回新目录并更新缓存。
 	up.mode.Store("ok")
@@ -252,14 +253,196 @@ func TestCatalogCacheLoadOrder(t *testing.T) {
 	put("/models", "client_version=0.161.0", `"other-path"`, 0)
 	big := `"` + strings.Repeat("x", codexCatalogBytes) + `"`
 	put("/v1/models", "client_version=0.158.0", big, 0) // 更新但超过 1 MiB 的旧缓存要跳过
-	if e := c.load("a", "/v1/models", "client_version=0.160.1"); e == nil || string(e.Body) != `"exact"` {
+	if e, _ := c.load("a", "/v1/models", "client_version=0.160.1", false); e == nil || string(e.Body) != `"exact"` {
 		t.Fatalf("应先取查询串完全相同的缓存，得到 %+v", e)
 	}
-	if e := c.load("a", "/v1/models", "client_version=0.162.0"); e == nil || string(e.Body) != `"newer"` {
+	if e, _ := c.load("a", "/v1/models", "client_version=0.162.0", false); e == nil || string(e.Body) != `"newer"` {
 		t.Fatalf("回退应取同一路径下最新的一份，得到 %+v", e)
 	}
-	if e := c.load("b", "/v1/models", "client_version=0.160.1"); e != nil {
-		t.Fatalf("另一把 key 不应取到缓存，得到 %+v", e)
+	if e, _ := c.load("b", "/v1/models", "client_version=0.160.1", false); e != nil {
+		t.Fatalf("不共享时另一把 key 不应取到缓存，得到 %+v", e)
+	}
+	// 共享时：其他凭据查询串完全相同的优先于更新的跨版本缓存；本凭据的跨版本缓存又优先于其他凭据的。
+	if e, from := c.load("b", "/v1/models", "client_version=0.160.1", true); e == nil || string(e.Body) != `"exact"` || from != "a" {
+		t.Fatalf("共享时应取 a 的同查询串缓存，得到 %+v（来自 %q）", e, from)
+	}
+	if e, from := c.load("b", "/v1/models", "client_version=0.163.0", true); e == nil || string(e.Body) != `"newer"` || from != "a" {
+		t.Fatalf("共享时没有同查询串的应取 a 最新的一份，得到 %+v（来自 %q）", e, from)
+	}
+	put2 := func(auth, query, body string) {
+		if err := c.store(auth, &catalogEntry{FetchedAt: base.Add(-2 * time.Hour), Path: "/v1/models", Query: query, Body: []byte(body)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	put2("b", "client_version=0.150.0", `"own-old"`)
+	if e, from := c.load("b", "/v1/models", "client_version=0.160.1", true); e == nil || string(e.Body) != `"own-old"` || from != "b" {
+		t.Fatalf("本凭据有跨版本缓存时应先用自己的，得到 %+v（来自 %q）", e, from)
+	}
+}
+
+// waitFetchesIdle 等后台回源全部结束（测试结束前调用，免得回源写缓存时临时目录已被删）。
+func waitFetchesIdle(t *testing.T, p *proxy) {
+	t.Helper()
+	for i := 0; i < 250; i++ {
+		p.fetches.mu.Lock()
+		n := len(p.fetches.m)
+		p.fetches.mu.Unlock()
+		if n == 0 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("后台回源一直没有结束")
+}
+
+// 网关比 catalogTimeout 慢：请求到点拿缓存，回源在后台做完并刷新缓存；慢不把网关标为不可用。
+func TestCatalogSlowUpstreamRefreshesInBackground(t *testing.T) {
+	up := newCatalogUpstream(t)
+	px, p := newTestProxy(t, up.URL)
+	getCatalog(t, px.URL, "k1", "0.160.1")
+	const v2 = `{"models":[{"slug":"gpt-6.1-sol"},{"slug":"gpt-6.2-sol"}]}`
+	up.body.Store(v2)
+	up.mode.Store("slow")
+	start := time.Now()
+	if code, body, src := getCatalog(t, px.URL, "k1", "0.160.1"); code != 200 || body != catalogV1 || src != "cache" {
+		t.Fatalf("慢网关: %d %q %q，应到点返回旧缓存", code, body, src)
+	}
+	if el := time.Since(start); el > 1500*time.Millisecond {
+		t.Fatalf("用了 %v，应在 catalog_timeout 到点返回", el)
+	}
+	if p.gate.isDown() {
+		t.Fatal("目录接口慢不应把网关标为不可用")
+	}
+	waitFetchesIdle(t, p)
+	up.mode.Store("503")
+	if _, body, src := getCatalog(t, px.URL, "k1", "0.160.1"); src != "cache" || body != v2+"\n" {
+		t.Fatalf("后台回源应已把新目录写进缓存，得到 %q %q", body, src)
+	}
+}
+
+// 同一凭据并发的目录请求只回源一次。
+func TestCatalogConcurrentRequestsShareFetch(t *testing.T) {
+	up := newCatalogUpstream(t)
+	px, p := newTestProxy(t, up.URL)
+	getCatalog(t, px.URL, "k1", "0.160.1")
+	up.mode.Store("slow")
+	hits := up.hits.Load()
+	done := make(chan string, 5)
+	for i := 0; i < 5; i++ {
+		go func() {
+			req, _ := http.NewRequest(http.MethodGet, px.URL+"/v1/models?client_version=0.160.1", nil)
+			req.Header.Set("Authorization", "Bearer k1")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				done <- err.Error()
+				return
+			}
+			resp.Body.Close()
+			done <- resp.Header.Get("X-Local-Proxy-Catalog")
+		}()
+	}
+	for i := 0; i < 5; i++ {
+		if src := <-done; src != "cache" {
+			t.Fatalf("第 %d 个请求来源 %q，应为 cache", i, src)
+		}
+	}
+	waitFetchesIdle(t, p)
+	if n := up.hits.Load() - hits; n != 1 {
+		t.Fatalf("并发 5 个请求回源 %d 次，应只 1 次", n)
+	}
+}
+
+// 带条件头或 Range 的请求单独回源：不加入普通请求在途的回源，普通请求也不加入它的；两个普通请求仍只回源一次。
+func TestCatalogOwnFetchNotShared(t *testing.T) {
+	up := newCatalogUpstream(t)
+	px, p := newTestProxy(t, up.URL, func(c *config) { c.CatalogTimeout = duration(3 * time.Second) })
+	up.mode.Store("slow")
+	send := func(h http.Header) <-chan int {
+		ch := make(chan int, 1)
+		go func() {
+			req, _ := http.NewRequest(http.MethodGet, px.URL+"/v1/models?client_version=0.160.1", nil)
+			req.Header = h
+			req.Header.Set("Authorization", "Bearer k1")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				ch <- 0
+				return
+			}
+			resp.Body.Close()
+			ch <- resp.StatusCode
+		}()
+		return ch
+	}
+	for _, k := range []string{"If-Modified-Since", "Range", "If-Match"} {
+		for _, ownFirst := range []bool{false, true} {
+			hits := up.hits.Load()
+			own := http.Header{k: {"x"}}
+			var a, b, c <-chan int
+			if ownFirst {
+				a = send(own)
+				time.Sleep(100 * time.Millisecond)
+				b, c = send(http.Header{}), send(http.Header{})
+			} else {
+				b, c = send(http.Header{}), send(http.Header{})
+				time.Sleep(100 * time.Millisecond)
+				a = send(own)
+			}
+			<-a
+			<-b
+			<-c
+			waitFetchesIdle(t, p)
+			if n := up.hits.Load() - hits; n != 2 {
+				t.Fatalf("%s（先发 %v）: 回源 %d 次，应为 2（带头的单独一次、两个普通请求合并一次）", k, ownFirst, n)
+			}
+		}
+	}
+}
+
+// 新 key 还没有缓存、客户端先走了：回源照样做完，留下这把 key 的第一份缓存。
+func TestCatalogBackgroundFetchOutlivesClient(t *testing.T) {
+	up := newCatalogUpstream(t)
+	px, p := newTestProxy(t, up.URL, func(c *config) { c.CatalogTimeout = duration(3 * time.Second) })
+	up.mode.Store("slow")
+	req, _ := http.NewRequest(http.MethodGet, px.URL+"/v1/models?client_version=0.160.1", nil)
+	req.Header.Set("Authorization", "Bearer k1")
+	if _, err := (&http.Client{Timeout: 300 * time.Millisecond}).Do(req); err == nil {
+		t.Fatal("客户端应先超时")
+	}
+	waitFetchesIdle(t, p)
+	up.mode.Store("503")
+	if code, body, src := getCatalog(t, px.URL, "k1", "0.160.1"); code != 200 || body != catalogV1 || src != "cache" {
+		t.Fatalf("客户端离开后回源应仍写下缓存，得到 %d %q %q", code, body, src)
+	}
+}
+
+// 回源超过 catalog_fetch_timeout：放弃，不写缓存，也不把网关标为不可用。
+func TestCatalogFetchTimeout(t *testing.T) {
+	up := newCatalogUpstream(t)
+	px, p := newTestProxy(t, up.URL, func(c *config) { c.CatalogFetchTimeout = duration(time.Second) })
+	up.mode.Store("slow")
+	if code, _, _ := getCatalog(t, px.URL, "k1", "0.160.1"); code != http.StatusBadGateway {
+		t.Fatalf("没有缓存、到点未回，应为 502，得到 %d", code)
+	}
+	waitFetchesIdle(t, p)
+	if p.gate.isDown() {
+		t.Fatal("回源超时不应把网关标为不可用")
+	}
+	if e, _ := p.cache.load(authHash(http.Header{"Authorization": {"Bearer k1"}}), "/v1/models", "client_version=0.160.1", false); e != nil {
+		t.Fatal("超时放弃的回源不应写缓存")
+	}
+}
+
+// 打开共享时，没有自己缓存的 key 借用其他 key 的缓存，响应头标 cache-shared。
+func TestCatalogSharedAcrossKeys(t *testing.T) {
+	up := newCatalogUpstream(t)
+	px, _ := newTestProxy(t, up.URL, func(c *config) { c.CatalogShareAcrossKeys = true })
+	getCatalog(t, px.URL, "k1", "0.160.1")
+	up.mode.Store("503")
+	if code, body, src := getCatalog(t, px.URL, "k2", "0.160.1"); code != 200 || body != catalogV1 || src != "cache-shared" {
+		t.Fatalf("k2 应借用 k1 的缓存，得到 %d %q %q", code, body, src)
+	}
+	if code, _, src := getCatalog(t, px.URL, "k1", "0.160.1"); code != 200 || src != "cache" {
+		t.Fatalf("k1 用自己的缓存，得到 %d %q", code, src)
 	}
 }
 
@@ -274,7 +457,7 @@ func TestCatalogUnusableWithoutCachePassesThrough(t *testing.T) {
 			t.Fatalf("%s: %d %q", mode, code, src)
 		}
 	}
-	if p.cache.load(authHash(http.Header{"Authorization": {"Bearer k1"}}), "/v1/models", "client_version=0.160.1") != nil {
+	if e, _ := p.cache.load(authHash(http.Header{"Authorization": {"Bearer k1"}}), "/v1/models", "client_version=0.160.1", false); e != nil {
 		t.Fatal("codex 用不了的目录不应写进缓存")
 	}
 	if p.gate.isDown() {

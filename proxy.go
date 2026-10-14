@@ -34,6 +34,7 @@ type proxy struct {
 	enc      *zstd.Encoder
 	compress map[string]bool
 	cache    *catalogCache
+	fetches  *catalogFetches
 }
 
 // newProxy 按一份已校验的配置组装转发链路。配置热加载时整体换新的 proxy，旧的在途请求走完后由 close 收尾。
@@ -67,6 +68,7 @@ func newProxy(cfg *config, gate *upstreamGate) (*proxy, error) {
 		enc:      enc,
 		compress: map[string]bool{},
 		cache:    &catalogCache{dir: cfg.cacheDir},
+		fetches:  &catalogFetches{m: map[string]*catalogFetch{}},
 	}
 	for _, path := range cfg.CompressPaths {
 		p.compress[path] = true

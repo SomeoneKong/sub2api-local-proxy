@@ -44,7 +44,11 @@ type config struct {
 	// 关掉时目录请求与其他请求一样原样转发。
 	CatalogCache   bool     `json:"catalog_cache"`
 	CatalogPath    string   `json:"catalog_path"`
-	CatalogTimeout duration `json:"catalog_timeout"` // 回源超时，超时即用缓存；要小于 codex 的 5 秒
+	CatalogTimeout duration `json:"catalog_timeout"` // 请求等回源的上限，到点即用缓存；要小于 codex 的 5 秒
+	// 回源本身的上限：请求不再等之后回源在后台继续，拿到目录照样写缓存，网关慢时缓存也能刷新。
+	CatalogFetchTimeout duration `json:"catalog_fetch_timeout"`
+	// 本凭据没有缓存时借用其他凭据的缓存。只在全部 key 属于同一分组（目录相同）时打开。
+	CatalogShareAcrossKeys bool `json:"catalog_share_across_keys"`
 
 	// 上行 zstd 压缩：只能填网关读请求体时会解压的路径。
 	Compress         bool     `json:"compress"`
@@ -73,6 +77,7 @@ func defaultConfig() config {
 		CatalogCache:          true,
 		CatalogPath:           "/v1/models",
 		CatalogTimeout:        duration(3 * time.Second),
+		CatalogFetchTimeout:   duration(60 * time.Second),
 		Compress:              true,
 		CompressPaths:         []string{"/v1/responses", "/v1/responses/compact", "/v1/alpha/search"},
 		CompressMinBytes:      1024,
@@ -182,6 +187,9 @@ func (c *config) validate() error {
 	}
 	if c.CatalogTimeout <= 0 {
 		return errors.New("catalog_timeout 必须大于 0")
+	}
+	if c.CatalogFetchTimeout < c.CatalogTimeout {
+		return errors.New("catalog_fetch_timeout 不能小于 catalog_timeout")
 	}
 	if c.CompressMinBytes < 0 {
 		return errors.New("compress_min_bytes 不能为负")
